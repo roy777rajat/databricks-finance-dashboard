@@ -1,0 +1,27 @@
+command: ["streamlit", "run", "app.py"]
+
+env:
+  - name: "STREAMLIT_SERVER_PORT"
+    value: "8000"
+  - name: "STREAMLIT_BROWSER_GATHER_USAGE_STATS"
+    value: "false"
+  - name: "SOURCE_CATALOG"
+    value: "finance_zerobus"
+  - name: "SOURCE_SCHEMA"
+    value: "transaction"
+  - name: "STREAMLIT_THEME_BASE"
+    value: "light"
+  - name: "STREAMLIT_THEME_PRIMARY_COLOR"
+    value: "#FF3621"
+  - name: "STREAMLIT_THEME_BACKGROUND_COLOR"
+    value: "#F5F7FA"
+  - name: "STREAMLIT_THEME_SECONDARY_BACKGROUND_COLOR"
+    value: "#FFFFFF"
+  - name: "STREAMLIT_THEME_TEXT_COLOR"
+    value: "#1B3139"
+  - name: "STREAMLIT_THEME_FONT"
+    value: "sans serif"
+  # Comma-separated job IDs that the dashboard SHOULD query directly for runs.
+  # The SP must have CAN_VIEW on each. Unreadable ones are skipped gracefully.
+  - name: "JOB_IDS"
+    value: "44401574415466"
