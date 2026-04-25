@@ -24,6 +24,14 @@
 
 ---
 
+## 🎯 The Problem (and Why This Project Exists)
+
+Every UPI tap, ATM withdrawal, and card swipe in India lands as an email in your inbox within seconds. That's a free, real-time stream of structured financial events — except it isn't structured at all. It's HTML, regional bank templates, inconsistent fields, and merchant names buried in noise. Most people manually scan these.
+
+I wanted to build the platform that processes them automatically — and I wanted to do it the way a modern data team would build it for a million users, not as a weekend hack. **From inbox to insight in under 90 seconds**, end-to-end, with zero infrastructure to babysit.
+
+---
+
 ## ✨ Features
 
 ### 📊 Page 1 — Quick View
@@ -93,6 +101,42 @@ The **Top N Merchants** horizontal bar chart (configurable from the sidebar) rev
 </p>
 
 Page 2 is the **operations view**: the last 10 pipeline runs from the Databricks Jobs REST API (with status, duration, and joined ingest/success/failure counts), the bad-records quarantine grid (numpy-array-safe rendering of the `failure_reasons` column), and the **full transaction ledger** paginated 25-per-page with CSV export.
+
+---
+
+## 🧠 The Engineering Story — End-to-End in Seven Moves
+
+Beyond the screenshots, here's how the platform actually thinks. Each move below maps to a real component in this repo and a deliberate design decision behind it.
+
+### 🔹 1. Ingestion — Gmail's Unstructured Firehose → Zerobus → Databricks (with schema enforcement)
+
+I skipped IMAP polling and Auto Loader file drops entirely. A **Google Apps Script trigger** watches a labelled folder; the moment a transaction email arrives, it POSTs the raw payload directly to Databricks **Zerobus** — Databricks' purpose-built streaming-ingest endpoint. Schema is enforced **at the endpoint itself**, so malformed rows are rejected before they ever pollute the lake. OAuth `authorization_details` scope the access token to a single table, so even a leaked credential is contained. Time from email arrival to bronze commit: **under 60 seconds, no infrastructure to babysit.**
+
+### 🔹 2. Delta Landing → Auto-Trigger the Whole Pipeline
+
+Bronze landing tables have **Change Data Feed (CDF) enabled**. The medallion job uses `spark.readStream.table(...)` rather than batch reads, which means it auto-advances the moment new rows commit. With Databricks Workflows' **file-arrival trigger**, the entire transformation pipeline kicks off automatically — no cron, no polling, no orchestration code.
+
+### 🔹 3. Parsing the Unstructured Data → Structured Delta (validation, NULL checks, dedup)
+
+The bronze rows are HTML email bodies. PySpark transformations parse `amount`, `direction`, `counterparty`, `VPA`, `transaction reference`, and `timestamps` using bank-specific regex patterns. Every row is validated: NULL-checks on critical fields, type coercion on amounts, deduplication via window functions on `(message_id, event_time)`. Successful parses go to `silver_clean`. **Malformed rows go to `silver_quarantine` with an array column of `failure_reasons`** — auditable, replayable, and never silently dropped.
+
+### 🔹 4. Curated Silver → Gold Aggregations
+
+Silver carries the canonical, validated transaction. Gold rolls it up into four purpose-built tables: **daily summary**, **merchant summary**, **reconciliation metrics** (per-job ingest/success/fail counts), and **failure-reason rollups** for alerting.
+
+### 🔹 5. Lakehouse → Lakebase via CDC
+
+The serving layer is Lakebase — Databricks' managed Postgres. A **Synced Table** observes the silver/gold CDF and replays changes into Postgres in near-real-time. **One write to Delta, two read paths**: Spark for analytics, Postgres for the app. Same governance, same lineage, same Unity Catalog ACLs. The dashboard's paginated ledger reads in **<100ms** because it's hitting Postgres, not scanning Delta.
+
+### 🔹 6. The App — Streamlit on Databricks Apps
+
+Streamlit deployed natively as a Databricks App. Same workspace, same auth, same SP, same audit log. Two pages — **Quick View** (KPIs, latest-transaction ticker, daily-spend-vs-threshold chart) and **Job Details** (last 10 pipeline runs from the Jobs API, quarantine grid, full ledger). Token refresh on every connection, retry-on-401/403 fallback, NULL-safe timestamps via `COALESCE` — every production-grade detail handled.
+
+### 🔹 7. Vibe-Coding via Databricks MCP
+
+Here's the part most builders haven't seen yet: **I built almost the entire app conversationally**, through Databricks' MCP integration with Claude. Schema discovery, query iteration, app deployment, debugging — all in natural language. The model could execute SQL on my warehouse, deploy code to the workspace, read job logs, and fix bugs without me leaving the chat.
+
+This is the future of platform work: **the platform itself becomes programmable through dialogue**, and the friction between *"I want to build this"* and *"it's running in production"* collapses.
 
 ---
 
