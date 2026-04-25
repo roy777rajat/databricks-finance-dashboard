@@ -1,0 +1,155 @@
+// ================= CONFIG =================
+var WORKSPACE_URL = "https://dbc-xxxxxxxxxx.cloud.databricks.com";
+var WORKSPACE_ID = "xxxxxxxxx";
+
+var CLIENT_ID = "xxxxxxxxxxx";
+var CLIENT_SECRET = "xxxxxxxxxxx";
+
+var CATALOG = "xxxxxxxxx";
+var SCHEMA = "xxxxxxxxxxx";
+var TABLE = "xxxxxxxxx";
+
+var FULL_TABLE = CATALOG + "." + SCHEMA + "." + TABLE;
+
+var ZEROBUS_ENDPOINT =
+  "https://" + WORKSPACE_ID + ".zerobus.us-west-2.cloud.databricks.com/zerobus/v1/tables/" +
+  FULL_TABLE + "/insert";
+
+
+// ================= MAIN FUNCTION =================
+function processHdfcEmails() {
+
+  var threads = GmailApp.search('label:HDFC_ALERT is:unread');
+
+  // ?? EXIT if no emails
+  if (!threads || threads.length === 0) {
+    Logger.log("No new emails ? skipping token + API");
+    return;
+  }
+
+  var records = [];
+  var nowMicros = Date.now() * 1000;
+  var processed = PropertiesService.getScriptProperties();
+
+  threads.forEach(thread => {
+    var messages = thread.getMessages();
+
+    messages.forEach(msg => {
+
+      if (processed.getProperty(msg.getId())) return;
+
+      records.push({
+        id: msg.getId(),
+        thread_id: thread.getId(),
+        subject: msg.getSubject(),
+        sender: msg.getFrom(),
+        recipient: msg.getTo(),
+        body: msg.getPlainBody(),
+        snippet: msg.getPlainBody().substring(0, 200),
+        event_time: nowMicros,
+        ingestion_time: nowMicros
+      });
+
+      processed.setProperty(msg.getId(), "done");
+
+      // mark as read after processing
+      msg.markRead();
+    });
+  });
+
+  // ?? EXIT if nothing new
+  if (records.length === 0) {
+    Logger.log("No new records after dedup");
+    return;
+  }
+
+  Logger.log("New records found: " + records.length);
+
+  // ? FETCH TOKEN ONLY NOW
+  var token = getAccessToken();
+
+  // ? CALL ZEROBUS
+  callZeroBus(records, token);
+}
+
+
+// ================= TOKEN FUNCTION =================
+function getAccessToken() {
+
+  var url = WORKSPACE_URL + "/oidc/v1/token";
+
+  var auth = Utilities.base64Encode(CLIENT_ID + ":" + CLIENT_SECRET);
+
+  var authorizationDetails = [
+    {
+      type: "unity_catalog_privileges",
+      privileges: ["USE CATALOG"],
+      object_type: "CATALOG",
+      object_full_path: CATALOG
+    },
+    {
+      type: "unity_catalog_privileges",
+      privileges: ["USE SCHEMA"],
+      object_type: "SCHEMA",
+      object_full_path: CATALOG + "." + SCHEMA
+    },
+    {
+      type: "unity_catalog_privileges",
+      privileges: ["SELECT", "MODIFY"],
+      object_type: "TABLE",
+      object_full_path: FULL_TABLE
+    }
+  ];
+
+  var payload = {
+    grant_type: "client_credentials",
+    scope: "all-apis",
+    resource: "api://databricks/workspaces/" + WORKSPACE_ID + "/zerobusDirectWriteApi",
+    authorization_details: JSON.stringify(authorizationDetails)
+  };
+
+  var options = {
+    method: "post",
+    contentType: "application/x-www-form-urlencoded",
+    headers: {
+      Authorization: "Basic " + auth
+    },
+    payload: payload,
+    muteHttpExceptions: true
+  };
+
+  var response = UrlFetchApp.fetch(url, options);
+
+  var code = response.getResponseCode();
+  var body = response.getContentText();
+
+  Logger.log("Token response code: " + code);
+  Logger.log("Token response body: " + body);
+
+  if (code !== 200) {
+    throw new Error("Failed to fetch token");
+  }
+
+  var json = JSON.parse(body);
+  return json.access_token;
+}
+
+
+// ================= ZEROBUS CALL =================
+function callZeroBus(records, token) {
+
+  var options = {
+    method: "post",
+    contentType: "application/json",
+    headers: {
+      Authorization: "Bearer " + token
+    },
+    payload: JSON.stringify(records),
+    muteHttpExceptions: true
+  };
+
+  var response = UrlFetchApp.fetch(ZEROBUS_ENDPOINT, options);
+
+  Logger.log("ZeroBus response code: " + response.getResponseCode());
+  Logger.log("ZeroBus response body: " + response.getContentText());
+}

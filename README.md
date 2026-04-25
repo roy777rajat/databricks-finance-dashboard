@@ -14,11 +14,12 @@
   <img src="https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white" alt="Python"/>
   <img src="https://img.shields.io/badge/Lakebase-Postgres_17-336791?logo=postgresql&logoColor=white" alt="Lakebase"/>
   <img src="https://img.shields.io/badge/Lakehouse-Delta-00ADD8?logo=apache&logoColor=white" alt="Lakehouse"/>
+  <img src="https://img.shields.io/badge/Zerobus-Streaming_Ingest-FF6B35" alt="Zerobus"/>
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"/>
 </p>
 
 <p align="center">
-  <b>#Databricks</b> · <b>#Lakehouse</b> · <b>#Lakebase</b> · <b>#DataEngineering</b> · <b>#Streamlit</b> · <b>#PersonalFinance</b> · <b>#FinTech</b> · <b>#MedallionArchitecture</b> · <b>#UnityCatalog</b> · <b>#DeltaLake</b> · <b>#ETL</b> · <b>#OpenSource</b>
+  <b>#Databricks</b> · <b>#Lakehouse</b> · <b>#Lakebase</b> · <b>#Zerobus</b> · <b>#DataEngineering</b> · <b>#Streamlit</b> · <b>#PersonalFinance</b> · <b>#FinTech</b> · <b>#MedallionArchitecture</b> · <b>#UnityCatalog</b> · <b>#DeltaLake</b> · <b>#ETL</b> · <b>#OpenSource</b>
 </p>
 
 ---
@@ -54,7 +55,7 @@
 
 The pipeline follows the **medallion pattern** end-to-end:
 
-1. **Source** — Gmail API ingested via a scheduled Databricks Job (batch ETL)
+1. **Source** — Gmail mailbox watched by a Google Apps Script trigger; matching emails pushed straight into Databricks via the **Zerobus streaming endpoint**
 2. **Medallion (Lakehouse)** — Bronze (raw email payloads) → Silver (parsed transactions + a quarantine table for malformed rows) → Gold (daily / merchant / reconciliation / failure-reason summaries)
 3. **Serving (Lakebase + APIs)** — Lakebase (managed Postgres) syncs key tables for sub-100ms reads; SQL Warehouse handles ad-hoc queries; Jobs API surfaces pipeline run history
 4. **App** — Streamlit deployed as a Databricks App, reading exclusively from the serving layer
@@ -95,6 +96,55 @@ Page 2 is the **operations view**: the last 10 pipeline runs from the Databricks
 
 ---
 
+## ⚡ Low-Latency Ingestion — Google Apps Script × Databricks Zerobus
+
+This project skips the traditional "scheduled batch poll" pattern entirely. Instead, the moment a transaction email arrives in Gmail, it lands in the Databricks Lakehouse **within seconds** via the [Zerobus](https://www.databricks.com/blog/announcing-zerobus) streaming-ingest API. The reference implementation is in [`gmail-zerobus-ingest/app.script`](gmail-zerobus-ingest/app.script).
+
+### How it works
+
+1. **Gmail-side trigger (Google Apps Script)**
+   A small Apps Script project runs on a 1-minute time-driven trigger, scanning a labelled folder (`label:HDFC_ALERT is:unread`) for new bank notifications. The script de-duplicates against `PropertiesService` (so the same email is never sent twice), marks each processed message as read, and only requests an OAuth token *after* finding fresh records — keeping the script idle-cheap.
+
+2. **Service-principal authentication (OAuth 2.0 client credentials)**
+   The script exchanges a Databricks **client_id / client_secret** for an access token via `/oidc/v1/token`, scoped using OAuth `authorization_details` to grant **only** what's needed for this insert path:
+   - `USE CATALOG` on the target catalog
+   - `USE SCHEMA` on the target schema
+   - `SELECT` + `MODIFY` on the target landing table
+   This means the token leaving Google's network has zero ability to touch anything else in the workspace — a textbook least-privilege pattern.
+
+3. **Zerobus streaming insert**
+   The records are POSTed as JSON to:
+   ```
+   https://<workspace-id>.zerobus.us-west-2.cloud.databricks.com/zerobus/v1/tables/<catalog>.<schema>.<table>/insert
+   ```
+   Zerobus is Databricks' purpose-built **direct streaming-ingest endpoint** — no Kafka cluster, no Auto Loader file-drop, no warehouse warm-up. Each row is appended to the bronze Delta table with sub-second commit latency.
+
+### Why this matters
+
+| Traditional batch poll | Apps Script × Zerobus |
+|---|---|
+| Polls IMAP every N minutes — emails sit waiting | Apps Script trigger fires within 60s of email arrival |
+| Needs an always-on worker / cron host | Runs on Google's infrastructure for free |
+| Adds 1-N minutes of latency per stage | Sub-second commit to Delta after script fires |
+| Requires file-drop landing zone (S3/ADLS) + Auto Loader | Direct row-level streaming insert |
+| Schema-on-read messiness | Schema-enforced at the Zerobus endpoint |
+| Operational overhead (lambdas, queues, retries) | One Apps Script + one Databricks endpoint |
+
+The result: **a debit notification in your inbox shows up in the dashboard within ~60 seconds**, end-to-end — without running a single piece of infrastructure outside Google + Databricks.
+
+### Reference code
+
+The Apps Script source ships sanitized — every credential and identifier is replaced with `xxxxxxxxxxx` placeholders. To use it, you'll need to:
+- Create a Databricks **service principal** with a client secret
+- Grant that SP `USE CATALOG`, `USE SCHEMA`, and `SELECT`+`MODIFY` on the target bronze landing table
+- Create a Zerobus-enabled landing table in your catalog
+- Paste the client credentials and table FQN into the script's `CONFIG` block
+- Deploy the script with a 1-minute time trigger
+
+> ⚠️ **Never commit your real client_secret to a public repo.** Use [Apps Script properties](https://developers.google.com/apps-script/guides/properties) or [Google Cloud Secret Manager](https://cloud.google.com/secret-manager) to store them securely.
+
+---
+
 ## 🌊 Why Lakehouse + Lakebase Together — The Modern Data Platform Pattern
 
 This dashboard isn't just running on Databricks — it's running on the **two complementary halves** of Databricks' data platform working in concert. Understanding why this pairing matters is understanding why modern apps don't pick "one or the other".
@@ -112,8 +162,52 @@ Lakebase is Databricks' **managed Postgres**, designed specifically for the oper
 - **Auto-scaling 0.5–1 CU** with scale-to-zero — cheap to run, no warehouse warm-up
 - **Synced tables** — Delta changes flow into Postgres automatically via CDC
 
-### 🔗 The Critical Bridge — Synced Tables
-The magic isn't either system alone — it's the **CDC-based sync** between them. Your ETL writes once to Delta. A Lakebase Synced Table observes the Delta change-data-feed and **mirrors changes into Postgres in near-real-time**. Same governance, same lineage, same access control. **One write, two read paths.**
+### 🔗 The Critical Bridge — Synced Tables (Lakehouse → Lakebase via CDC)
+
+The magic isn't either system alone — it's the **Change Data Feed-based sync** between them. Here's the actual flow:
+
+1. **Bronze Delta tables have CDF enabled** — when the medallion job upserts rows, the table records every insert/update/delete in a hidden `_change_data` log:
+   ```sql
+   ALTER TABLE finance_zerobus.transaction.silver_clean
+   SET TBLPROPERTIES (delta.enableChangeDataFeed = true,
+                      delta.enableDeletionVectors = false);
+   ```
+
+2. **A Lakebase Synced Table observes the CDF** — Databricks runs a continuous reader that pulls `_change_data` rows out of Delta and replays them into the Postgres table. You configure it once in the Catalog UI; Databricks handles checkpointing, schema evolution, and back-pressure.
+
+3. **Postgres mirror stays fresh in near-real-time** — typical lag is seconds, not minutes. Same governance (Unity Catalog), same lineage, same access control. **One write, two read paths.**
+
+4. **The app reads only Postgres** — for paginated ledgers, point lookups by transaction ID, or filtered scans, the dashboard never touches Delta directly. Result: instant interactions, even on cold starts.
+
+### 🚀 The Auto-Trigger Pipeline — Streaming All The Way Down
+
+Beyond CDC, the bronze→silver→gold transformations themselves run as **streaming reads**, which means the pipeline auto-advances whenever the upstream table changes:
+
+```python
+# pyspark/01_bronze_to_silver_gmail_txn.py — bronze layer is a streaming read
+bronze_df = spark.readStream.table(f"{CATALOG}.{SCHEMA}.gmail_bronze")
+```
+
+This unlocks two powerful triggering modes for the wrapping Databricks Job:
+
+- **`Trigger.AvailableNow`** — runs when the job is invoked, processes everything new since the last checkpoint, then exits. Cheap, batch-friendly.
+- **`File arrival` / `Continuous`** — Databricks Workflows can launch the job the moment data lands in the landing table, removing the need for cron schedules entirely.
+
+Combined with the Apps Script + Zerobus front-door, the **end-to-end latency** is:
+
+```
+Email arrives in Gmail
+     ↓ (≤ 60s — Apps Script trigger)
+Bronze Delta table (Zerobus row commit)
+     ↓ (seconds — streaming readStream picks up)
+Silver + Gold Delta tables
+     ↓ (seconds — Lakebase CDC sync)
+Postgres mirror
+     ↓ (instant — app reads on click)
+Dashboard
+```
+
+**Total: usually under 90 seconds from inbox to dashboard.** Without managing a single message queue, file watcher, or polling loop.
 
 ### 🎯 Why This Matters in Modern Platforms
 
@@ -125,12 +219,13 @@ The magic isn't either system alone — it's the **CDC-based sync** between them
 | Reconcile two security models | ✅ Unity Catalog governs both |
 | Pay for an always-on transactional DB | ✅ Lakebase scales to zero when idle |
 
-This pattern — **batch analytics on Delta, low-latency serving on Postgres, unified by sync** — is the emerging standard for data-driven apps. Companies like Stripe, Airbnb, and Shopify use variations of this architecture; Databricks is the first platform to offer it as a single managed product.
+This pattern — **batch analytics on Delta, low-latency serving on Postgres, unified by sync, kicked off by streaming triggers** — is the emerging standard for data-driven apps. Databricks is the first platform to offer it as a single managed product end-to-end.
 
 In this project specifically:
 - **Page 2's Full Ledger** (paginated 25/page) reads from Lakebase — would feel sluggish on Delta
 - **Page 1's All-Time aggregates** read from gold Delta tables via the SQL Warehouse — Spark crunches the math faster than Postgres
 - **Jobs API** complements both for operational metadata (run history) — no ETL needed
+- **Zerobus** handles the inbound streaming firehose without Kafka or Auto Loader
 
 The dashboard is **fast, governed, observable, and cheap** because every layer is doing what it's designed to do.
 
@@ -145,12 +240,12 @@ Below is the data-flow story end-to-end — each surface picture reflects a real
   <img src="docs/01.Gmail.png" alt="Gmail transaction emails" width="80%"/>
 </p>
 
-A scheduled Databricks Job pulls bank-transaction emails from Gmail using the Gmail API. Every UPI, ATM withdrawal, and card transaction generates an email — those are our raw signal. Each batch lands as a row in `gmail_bronze` (Delta) with the original payload, sender, subject, body, and `event_time` (when the email actually arrived).
+Gmail is the source of truth. Bank-transaction alerts (UPI, ATM, card) are auto-labelled with `HDFC_ALERT`. A Google Apps Script trigger watches that label and pushes new messages to the Databricks **Zerobus** endpoint within ~60 seconds — see the section above for full details. Each row lands in `gmail_bronze` (Delta) with the original payload, sender, subject, body, and `event_time`.
 
 ### 2. Transform — Medallion in the Lakehouse
 The bronze rows flow through PySpark transformations that parse amount, direction, counterparty, VPA, and timestamps from the body. Successful parses land in `gmail_silver_clean`; malformed rows go to `gmail_silver_quarantine` with an array of `failure_reasons`. Aggregations roll up into four gold tables: daily summary, merchant summary, reconciliation metrics, and failure-reason counts.
 
-> See `pyspark/01_bronze_to_silver_gmail_txn.py` and `pyspark/02_silver_to_gold_gmail_views.py` for the actual transformation code.
+> See `pyspark/01_bronze_to_silver_gmail_txn.py` and `pyspark/02_silver_to_gold_gmail_views.py` for the actual transformation code. Both use **streaming reads** (`spark.readStream.table(...)`) so they auto-advance as bronze grows.
 
 ### 3. Serve — Lakebase Sync
 <p align="center">
@@ -184,13 +279,15 @@ Page 2's "Last 10 Pipeline Runs" calls `w.jobs.list_runs(...)` directly — no s
 
 | Layer | Tech |
 |---|---|
+| **Source trigger** | Google Apps Script (time-driven, 1-min interval) |
+| **Streaming ingest** | Databricks Zerobus (direct streaming-ingest endpoint) |
 | **Compute** | Databricks Apps (serverless), Databricks SQL Warehouse (serverless) |
 | **Storage** | Unity Catalog Delta tables, Lakebase (managed Postgres 17, autoscale 0.5–1 CU) |
-| **Ingestion** | Databricks Jobs (scheduled batch ETL) |
-| **Sync** | Lakebase Synced Tables (CDC-based) |
-| **Auth** | Databricks OAuth (SDK-managed token refresh) |
+| **Transformation** | PySpark Structured Streaming (`readStream.table`) + Databricks Jobs |
+| **Sync** | Lakebase Synced Tables (Delta CDF → Postgres replication) |
+| **Auth** | Databricks OAuth (SDK-managed token refresh on the app side, OAuth 2.0 client_credentials on the script side) |
 | **App Framework** | Streamlit 1.39 |
-| **Data** | pandas 2.2, Plotly 5.24 |
+| **Data libs** | pandas 2.2, Plotly 5.24 |
 | **SDKs** | databricks-sdk 0.38, databricks-sql-connector 3.7 |
 
 ---
@@ -199,23 +296,25 @@ Page 2's "Last 10 Pipeline Runs" calls `w.jobs.list_runs(...)` directly — no s
 
 ```
 databricks-finance-dashboard/
-├── app.py                         # Page 1 — Quick View
-├── app.yaml                       # Databricks Apps manifest (command, env vars)
-├── requirements.txt               # Python dependencies
+├── app.py                              # Page 1 — Quick View
+├── app.yaml                            # Databricks Apps manifest (command, env vars)
+├── requirements.txt                    # Python dependencies
 ├── lib/
-│   ├── data.py                    # Warehouse connection, token refresh, query cache
-│   ├── formatters.py              # INR formatter, numpy-safe array-to-string
-│   └── theme.py                   # Design system: KPI cards, ticker, plotly defaults
+│   ├── data.py                         # Warehouse connection, token refresh, query cache
+│   ├── formatters.py                   # INR formatter, numpy-safe array-to-string
+│   └── theme.py                        # Design system: KPI cards, ticker, plotly defaults
 ├── pages/
-│   └── 1_⚙️_Job_Details.py       # Page 2 — Operations view
-├── pyspark/                       # Reference upstream ETL (run as Databricks Jobs)
+│   └── 1_⚙️_Job_Details.py            # Page 2 — Operations view
+├── pyspark/                            # Reference upstream ETL (run as Databricks Jobs)
 │   ├── 01_bronze_to_silver_gmail_txn.py
 │   └── 02_silver_to_gold_gmail_views.py
+├── gmail-zerobus-ingest/               # Low-latency ingestion (Google Apps Script)
+│   └── app.script
 └── docs/
-    ├── Banner.png                 # Hero banner
-    ├── Architecture.png           # System architecture diagram
-    ├── Finance-1.JPG ... 4.JPG    # Dashboard screenshots
-    ├── 01.Gmail.png               # ETL pipeline visuals
+    ├── Banner.png                      # Hero banner
+    ├── Architecture.png                # System architecture diagram
+    ├── Finance-1.JPG ... 4.JPG         # Dashboard screenshots
+    ├── 01.Gmail.png                    # ETL pipeline visuals
     ├── 03.Lakebase.png
     ├── 04.databricksApp.png
     └── 05.Job-Databricks API.png
@@ -228,12 +327,9 @@ databricks-finance-dashboard/
 ### Prerequisites
 - Databricks workspace with Unity Catalog, a Serverless SQL Warehouse, and Databricks Apps enabled
 - A Lakebase database provisioned
-- An upstream ingestion pipeline producing these tables (not included in this repo):
-  - `<catalog>.<schema>.gmail_bronze`
-  - `<catalog>.<schema>.gmail_silver_clean`
-  - `<catalog>.<schema>.gmail_silver_quarantine`
-  - `<catalog>.<schema>.gmail_gold_recon_metrics`
-  - `<catalog>.<schema>.gmail_gold_failure_reasons`
+- A **Zerobus-enabled bronze landing table** (created from the Catalog UI)
+- A **service principal** with client credentials, granted `USE CATALOG`, `USE SCHEMA`, `SELECT`, `MODIFY` on the bronze landing table
+- A Google account with Apps Script access for the ingestion trigger
 - Lakebase-synced tables:
   - `<catalog>.<schema>.silver_transaction`
   - `<catalog>.<schema>.gold_transaction_summary`
@@ -257,14 +353,20 @@ databricks-finance-dashboard/
        value: ""   # Optional: comma-separated job IDs for Page 2
    ```
 
-3. **Upload to workspace**:
+3. **Configure ingestion** (`gmail-zerobus-ingest/app.script`):
+   - Replace the `xxxxxxxxxxx` placeholders in the `CONFIG` block with your workspace ID, SP credentials, catalog/schema/table
+   - Paste the script into a new Apps Script project at [script.google.com](https://script.google.com)
+   - Add a **time-driven trigger** for `processHdfcEmails` at 1-minute intervals
+   - Run once manually to authorise Gmail + UrlFetch scopes
+
+4. **Upload to workspace**:
    ```bash
    databricks workspace import-dir . /Workspace/Users/you@example.com/finance-dashboard
    ```
 
-4. **Create the app** in Databricks UI → Apps → Create, pointing to that path.
+5. **Create the app** in Databricks UI → Apps → Create, pointing to that path.
 
-5. **Grant the App's service principal**:
+6. **Grant the App's service principal**:
    - `USE CATALOG` + `USE SCHEMA` + `SELECT` on your schema
    - `CAN USE` on your SQL warehouse
    - `CAN VIEW` on each ingestion job (for Page 2 runs panel)
@@ -292,6 +394,7 @@ See `.env.example` for a full template.
 - **Graceful fallbacks** — Page 2 runs panel falls back to daily recon metrics when the SP lacks view permission on jobs
 - **Source transparency** — every tile shows its source table(s) in a footer for debugging
 - **"Today" means email arrival** — counts use `event_time` rather than `_bronze_ingested_at`, so pipeline re-runs don't inflate today's numbers
+- **Idle-cheap ingestion** — Apps Script only requests an OAuth token after finding new emails to send; zero API cost when the inbox is quiet
 
 ---
 
@@ -301,6 +404,7 @@ See `.env.example` for a full template.
 - App runs as a service principal with least-privilege grants
 - Lakebase connections use SDK-managed tokens, not long-lived passwords
 - Authentication is workspace-enforced; no anonymous access (by Databricks Apps design)
+- Apps Script tokens are scoped via OAuth `authorization_details` to a single table — even if leaked, they can't touch any other resource
 
 ---
 
@@ -321,5 +425,5 @@ Built iteratively with [Claude](https://claude.ai) using the Databricks MCP inte
 </p>
 
 <p align="center">
-  <b>#Databricks</b> · <b>#Lakehouse</b> · <b>#Lakebase</b> · <b>#DataPlatform</b> · <b>#StreamingETL</b> · <b>#Postgres</b> · <b>#PySpark</b> · <b>#FinTech</b>
+  <b>#Databricks</b> · <b>#Lakehouse</b> · <b>#Lakebase</b> · <b>#Zerobus</b> · <b>#DataPlatform</b> · <b>#StreamingETL</b> · <b>#Postgres</b> · <b>#PySpark</b> · <b>#FinTech</b> · <b>#GoogleAppsScript</b>
 </p>
